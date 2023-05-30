@@ -41,7 +41,7 @@ Please open an issue if you want to see your favorite optimization, precision or
 ## Installation
 
 ```console
-pip install genbench
+pip install git+https://github.com/hemildesai/genbench.git
 ```
 
 ## Usage
