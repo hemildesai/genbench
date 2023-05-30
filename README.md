@@ -12,6 +12,12 @@ An easy to use toolkit to run benchmarks on PyTorch based Generative models. Cur
 - Huggingface Transformers Text Generation Pipeline
 - Huggingface Transformers Model forward call
 
+It aims to collect benchmarks from a variety of sources (in addition to custom ones), including:
+
+- [fxmarty/efficient-attention-benchmark](https://github.com/fxmarty/efficient-attention-benchmark)
+- [optimum/benchmark_bettertransformer](https://github.com/huggingface/optimum/blob/main/tests/benchmark/benchmark_bettertransformer.py)
+- [tiktoken/scripts/benchmark.py](https://github.com/openai/tiktoken/blob/main/scripts/benchmark.py)
+
 The benchmarking functions return a dataframe with all necessary columns that can serve as a basis for further analysis.
 The columns are consistent so different benchmarks can be combined into one dataframe. This can help to run analysis across a variety of different factors like GPUs, Models, Batch Sizes, Optimizations, CUDA and CUDNN versions, torch.compile use, etc. It can also serve as a way to quickly get the best optimizations for a model. It also provides utility functions to easily profile models and functions via the Torch Profiler.
 
@@ -43,6 +49,8 @@ Please open an issue if you want to see your favorite optimization, precision or
 ```console
 pip install git+https://github.com/hemildesai/genbench.git
 ```
+
+If this doesn't work, you can clone the repo and do a manual install.
 
 ## Usage
 
@@ -76,6 +84,8 @@ with Optimizer(sdp_backend=SDPBackend.FLASH_ATTENTION, dtype=torch.float16, bett
     model = opt(model)
     model(...)
 ```
+
+See [llm_bench.ipynb](notebooks/llm_bench.ipynb) for a short notebook on how to analyze the dataframe.
 
 ## License
 
