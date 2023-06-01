@@ -23,7 +23,7 @@ The columns are consistent so different benchmarks can be combined into one data
 
 Additionally, it also provides an easy to use Optimizer that allows you to apply a variety of optimizations to a model and benchmark it.
 
-We provide CSV files for prerun benchmarks in the `benchmarks` folder. These can be used to quickly compare your results with ours. The folder will be updated regularly with new benchmarks. Example notebooks in the `notebooks` folder show how to quickly analyze the results.
+We provide CSV files for prerun benchmarks in the `benchmarks` folder. These can be used to quickly compare your results with ours. The folder will be updated regularly with new models. Example notebooks in the `notebooks` folder show how to quickly analyze the results.
 
 The following optimizations are currently supported (More coming soon, including CUDA graphs, Torch Dynamo export, etc):
 

@@ -11,9 +11,9 @@ class Optimizer:
     def __init__(
         self,
         sdp_backend: SDPBackend,
-        dtype: torch.dtype = torch.float32,
-        bettertransformer: bool = False,
-        compile: bool = False,
+        dtype: torch.dtype = torch.float16,
+        bettertransformer: bool = True,
+        compile: bool = True,
     ):
         self.sdp_backend = sdp_backend
         if sdp_backend == SDPBackend.ERROR:
