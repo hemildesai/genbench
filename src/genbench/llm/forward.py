@@ -19,7 +19,7 @@ from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
 from genbench.llm.utils import ModelForwardRecord
 from genbench.optimizer import Optimizer
-from genbench.utils import benchmark_transformers_with_memory
+from genbench.utils import benchmark_transformers_with_memory, garbage_collect
 
 set_seed(42)
 torch.backends.cudnn.benchmark = True  # type: ignore
@@ -27,7 +27,7 @@ torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore
 
 BATCH_SIZES = [1, 8]
 SEQ_LEN = [64, 128]
-NUM_TOKENS = [128]
+NUM_TOKENS = [128, 256]
 SDP_BACKENDS = [
     SDPBackend.ERROR,  # This means no kernel specific context manager
     SDPBackend.MATH,
@@ -101,14 +101,14 @@ def benchmark(
             pad_token_id=pad_token_id,
         )
         for _ in range(warmup_steps):
-            _ = model.generate(
+            model.generate(
                 input_ids, attention_mask=masks, generation_config=gen_config
             )
             torch.cuda.synchronize()
 
     else:
         for _ in range(warmup_steps):
-            _ = model(input_ids, masks)
+            model(input_ids, masks)
             torch.cuda.synchronize()
 
     print("Warmup done...")
@@ -149,12 +149,9 @@ def get_model(
 
     if use_cuda:
         with torch.device("cuda:0"):
-            model = autoclass.from_pretrained(model_name, torch_dtype=torch.float16)
-
-        model = model.to("cuda:0")
-        model = model.to(dtype)
+            model = autoclass.from_pretrained(model_name, torch_dtype=dtype)
     else:
-        model = autoclass.from_pretrained(model_name, torch_dtype=torch.float16)
+        model = autoclass.from_pretrained(model_name, torch_dtype=dtype)
         model = model.to(dtype)
 
     return model
@@ -184,11 +181,33 @@ def get_inputs(
     return input_ids, attention_mask
 
 
+def cleanup(
+    model: AutoModel | AutoModelForCausalLM | AutoModelForSeq2SeqLM,
+    input_ids: torch.Tensor,
+    masks: torch.Tensor | None,
+):
+    model.to("cpu")
+    input_ids.detach().to("cpu")
+    if torch.is_tensor(masks):
+        masks.detach().to("cpu")
+
+    del model
+    del input_ids
+    del masks
+    torch.cuda.empty_cache()
+    garbage_collect()
+
+
 def run_model_forward_benchmark(
     model_name: str,
     is_decoder: bool,
     num_batches: int,
     cpu_bench: bool = False,
+    batch_sizes: list[int] = BATCH_SIZES,
+    num_tokens_list: list[int] = NUM_TOKENS,
+    dtypes: list[torch.dtype] = DTYPES,
+    sdp_backends: list[SDPBackend] = SDP_BACKENDS,
+    seq_lens: list[int] = SEQ_LEN,
 ) -> list[ModelForwardRecord]:
     records: list[ModelForwardRecord] = []
     try:
@@ -206,16 +225,20 @@ def run_model_forward_benchmark(
     #     PAD_PERCENTAGES = [0, 0.1, 0.2, 0.5, 0.75]
 
     if cpu_bench:
-        cpu_max_token = 256
-        cpu_batch_size = 4
-        cpu_seq_len = 64
-        cpu_pad_percentage = 0
-        input_ids, masks = get_inputs(
-            model, cpu_batch_size, cpu_seq_len, cpu_pad_percentage, torch.device("cpu")
-        )
+        with torch.inference_mode():
+            cpu_max_token = 256
+            cpu_batch_size = 4
+            cpu_seq_len = 64
+            cpu_pad_percentage = 0
+            input_ids, masks = get_inputs(
+                model,
+                cpu_batch_size,
+                cpu_seq_len,
+                cpu_pad_percentage,
+                torch.device("cpu"),
+            )
 
-        try:
-            with torch.inference_mode():
+            try:
                 time, max_mem = benchmark(
                     model,
                     input_ids,
@@ -225,42 +248,45 @@ def run_model_forward_benchmark(
                     cpu_max_token,
                     tokenizer.pad_token_id,
                 )
-        except RuntimeError as e:
-            time, max_mem = -1.0, -1
-            print(e)
+            except RuntimeError as e:
+                time, max_mem = -1.0, -1
+                print(e)
 
-        records.append(
-            ModelForwardRecord(
-                model=model_name,
-                num_batches=num_batches,
-                batch_size=cpu_batch_size,
-                seq_len=cpu_seq_len,
-                pad_percentage=cpu_pad_percentage,
-                num_tokens=cpu_max_token,
-                time=time,
-                max_mem=max_mem,
-                sdp_backend="CPU",
-                dtype=str(model.dtype),  # type: ignore
-                bettertransformer=False,
-                gpu="CPU",
-                compile=False,
+            records.append(
+                ModelForwardRecord(
+                    model=model_name,
+                    num_batches=num_batches,
+                    batch_size=cpu_batch_size,
+                    seq_len=cpu_seq_len,
+                    pad_percentage=cpu_pad_percentage,
+                    num_tokens=cpu_max_token,
+                    time=time,
+                    max_mem=max_mem,
+                    sdp_backend="CPU",
+                    dtype=str(model.dtype),  # type: ignore
+                    bettertransformer=False,
+                    gpu="CPU",
+                    compile=False,
+                )
             )
-        )
+
+            del input_ids
+            del masks
 
     del model
 
     device = torch.device("cuda:0")
-    for params in tqdm(
-        list(itertools.product(BATCH_SIZES, DTYPES, SEQ_LEN, NUM_TOKENS))
-    ):
-        batch_size, dtype, seq_len, num_token = params
-        model = get_model(model_name, dtype, True)
-        input_ids, masks = get_inputs(
-            model, batch_size, seq_len, pad_percentage, device
-        )
+    with torch.inference_mode():
+        for params in tqdm(
+            list(itertools.product(batch_sizes, dtypes, seq_lens, num_tokens_list))
+        ):
+            batch_size, dtype, seq_len, num_token = params
+            model = get_model(model_name, dtype, True)
+            input_ids, masks = get_inputs(
+                model, batch_size, seq_len, pad_percentage, device
+            )
 
-        try:
-            with torch.inference_mode():
+            try:
                 time, max_mem = benchmark(
                     model,
                     input_ids,
@@ -270,60 +296,62 @@ def run_model_forward_benchmark(
                     num_token,
                     tokenizer.pad_token_id,
                 )
-        except RuntimeError as e:
-            time, max_mem = -1.0, -1
-            print(e)
+            except RuntimeError as e:
+                time, max_mem = -1.0, -1
+                print(e)
+            finally:
+                cleanup(model, input_ids, masks)
 
-        records.append(
-            ModelForwardRecord(
-                model=model_name,
-                num_batches=num_batches,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                pad_percentage=pad_percentage,
-                num_tokens=num_token,
-                time=time,
-                max_mem=max_mem,
-                sdp_backend="EAGER",
-                dtype=str(dtype),
-                bettertransformer=False,
-                gpu=torch.cuda.get_device_name(),
-                compile=False,
+            records.append(
+                ModelForwardRecord(
+                    model=model_name,
+                    num_batches=num_batches,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    pad_percentage=pad_percentage,
+                    num_tokens=num_token,
+                    time=time,
+                    max_mem=max_mem,
+                    sdp_backend="EAGER",
+                    dtype=str(dtype),
+                    bettertransformer=False,
+                    gpu=torch.cuda.get_device_name(),
+                    compile=False,
+                )
             )
-        )
 
-    for params in tqdm(
-        list(
-            itertools.product(
-                SDP_BACKENDS,
-                DTYPES,
-                BETTERTRANSFORMER,
-                COMPILE,
-                BATCH_SIZES,
-                NUM_TOKENS,
-                SEQ_LEN,
+    with torch.inference_mode():
+        for params in tqdm(
+            list(
+                itertools.product(
+                    sdp_backends,
+                    dtypes,
+                    BETTERTRANSFORMER,
+                    COMPILE,
+                    batch_sizes,
+                    num_tokens_list,
+                    seq_lens,
+                )
             )
-        )
-    ):
-        (
-            sdp_backend,
-            dtype,
-            bettertransformer,
-            compile,
-            batch_size,
-            num_token,
-            seq_len,
-        ) = params
-        model = get_model(model_name, dtype, True)
-        input_ids, masks = get_inputs(
-            model, batch_size, seq_len, pad_percentage, device
-        )
+        ):
+            (
+                sdp_backend,
+                dtype,
+                bettertransformer,
+                compile,
+                batch_size,
+                num_token,
+                seq_len,
+            ) = params
+            model = get_model(model_name, dtype, True)
+            input_ids, masks = get_inputs(
+                model, batch_size, seq_len, pad_percentage, device
+            )
 
-        with Optimizer(sdp_backend, dtype, bettertransformer, compile) as opt:
-            model = opt(model)
+            with Optimizer(sdp_backend, dtype, bettertransformer, compile) as opt:
+                model = opt(model)
 
-            try:
-                with torch.inference_mode():
+                try:
                     time, max_mem = benchmark(
                         model,
                         input_ids,
@@ -333,30 +361,32 @@ def run_model_forward_benchmark(
                         num_token,
                         tokenizer.pad_token_id,
                     )
-            except RuntimeError as e:
-                time, max_mem = -1.0, -1
-                print(e)
+                except RuntimeError as e:
+                    time, max_mem = -1.0, -1
+                    print(e)
+                finally:
+                    cleanup(model, input_ids, masks)
 
-        records.append(
-            ModelForwardRecord(
-                model=model_name,
-                num_batches=num_batches,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                pad_percentage=pad_percentage,
-                num_tokens=num_token,
-                time=time,
-                max_mem=max_mem,
-                sdp_backend=opt.sdp_backend.name
-                if sdp_backend != SDPBackend.ERROR
-                else "NATIVE",
-                dtype=str(dtype),
-                bettertransformer=bettertransformer,
-                gpu=torch.cuda.get_device_name(),
-                compile=opt.compile,
-                compile_mode=opt.compile_mode if opt.compile else None,
+            records.append(
+                ModelForwardRecord(
+                    model=model_name,
+                    num_batches=num_batches,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    pad_percentage=pad_percentage,
+                    num_tokens=num_token,
+                    time=time,
+                    max_mem=max_mem,
+                    sdp_backend=opt.sdp_backend.name
+                    if sdp_backend != SDPBackend.ERROR
+                    else "NATIVE",
+                    dtype=str(dtype),
+                    bettertransformer=bettertransformer,
+                    gpu=torch.cuda.get_device_name(),
+                    compile=opt.compile,
+                    compile_mode=opt.compile_mode if opt.compile else None,
+                )
             )
-        )
 
     return records
 
@@ -365,11 +395,21 @@ def get_model_forward_benchmark_df(
     model_name: str,
     num_batches: int = 32,
     cpu_bench: bool = False,
+    batch_sizes: list[int] = BATCH_SIZES,
+    num_tokens_list: list[int] = NUM_TOKENS,
+    dtypes: list[torch.dtype] = DTYPES,
+    sdp_backends: list[SDPBackend] = SDP_BACKENDS,
+    seq_lens: list[int] = SEQ_LEN,
 ) -> pd.DataFrame:
     records = run_model_forward_benchmark(
         model_name=model_name,
         is_decoder=True,
         num_batches=num_batches,
         cpu_bench=cpu_bench,
+        batch_sizes=batch_sizes,
+        num_tokens_list=num_tokens_list,
+        dtypes=dtypes,
+        sdp_backends=sdp_backends,
+        seq_lens=seq_lens,
     )
     return pd.DataFrame([r.__dict__ for r in records])

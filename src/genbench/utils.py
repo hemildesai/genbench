@@ -1,3 +1,7 @@
+import gc
+import operator
+from functools import reduce
+
 import torch
 import torch.utils.benchmark as benchmark
 from torch.backends.cuda import SDPBackend
@@ -59,10 +63,8 @@ def benchmark_function(
     end_event.record()  # type: ignore
 
     torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     time = (start_event.elapsed_time(end_event)) / n_repeat
-
-    del start_event
-    del end_event
     return time
 
 
@@ -79,13 +81,55 @@ def benchmark_transformers_with_memory(
     start_event.record()  # type: ignore
     for _ in tqdm(range(num_batches)):
         if is_decoder:
-            _ = model.generate(
+            model.generate(
                 input_ids, attention_mask=masks, generation_config=generation_config
             )
         else:
-            _ = model(input_ids, masks)
+            model(input_ids, masks)
     end_event.record()  # type: ignore
+
     torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     max_memory = torch.cuda.max_memory_allocated()
 
     return start_event.elapsed_time(end_event) / num_batches, max_memory
+
+
+def garbage_collect() -> None:
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                del obj
+            elif hasattr(obj, "data") and torch.is_tensor(obj.data):
+                del obj.data
+                del obj
+        except:
+            pass
+
+    torch.cuda.empty_cache()
+
+
+def get_gc_tensors() -> list[torch.Tensor]:
+    tensors = []
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                print(
+                    reduce(operator.mul, obj.size()) if len(obj.size()) > 0 else 0,
+                    type(obj),
+                    obj.size(),
+                )
+                tensors.append(obj)
+            elif hasattr(obj, "data") and torch.is_tensor(obj.data):
+                print(
+                    reduce(operator.mul, obj.data.size())
+                    if len(obj.data.size()) > 0
+                    else 0,
+                    type(obj),
+                    obj.data.size(),
+                )
+                tensors.append(obj.data)
+        except:
+            pass
+
+    return tensors

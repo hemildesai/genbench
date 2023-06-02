@@ -16,7 +16,7 @@ from transformers.pipelines.text_generation import TextGenerationPipeline
 from genbench.llm.fschat_conversation import conv_templates, get_conv_template
 from genbench.llm.utils import TextGenerationPipelineRecord, get_questions
 from genbench.optimizer import Optimizer
-from genbench.utils import benchmark_function
+from genbench.utils import benchmark_function, garbage_collect
 
 set_seed(42)
 torch.backends.cudnn.benchmark = True  # type: ignore
@@ -52,7 +52,7 @@ def run_warmup(
     pipeline: TextGenerationPipeline | Text2TextGenerationPipeline,
     warmup_steps: int = 3,
 ):
-    prompts = _get_prompts(2, pipeline.model.config.model_type)
+    prompts = _get_prompts(1, pipeline.model.config.model_type)
     for _ in range(warmup_steps):
         pipeline(prompts, max_length=1024, num_return_sequences=1)
 
@@ -63,11 +63,12 @@ def get_pipeline(
     model_name: str, batch_size: int, device: int | str, dtype: torch.dtype | None
 ) -> TextGenerationPipeline | Text2TextGenerationPipeline:
     generator = pipeline(
-        "text-generation", model=model_name, device=device, batch_size=batch_size
+        "text-generation",
+        model=model_name,
+        device=device,
+        batch_size=batch_size,
+        torch_dtype=dtype,
     )
-
-    if dtype:
-        generator.model = generator.model.to(dtype=dtype)
 
     generator = cast(TextGenerationPipeline | Text2TextGenerationPipeline, generator)
 
@@ -125,7 +126,7 @@ def run_generator(
             model_inputs=model_inputs,
             **forward_params,
         )
-        del model_inputs
+
     else:
         time = benchmark_function(
             generator,
@@ -138,11 +139,26 @@ def run_generator(
     return time
 
 
+def cleanup(
+    pipeline: TextGenerationPipeline | Text2TextGenerationPipeline,
+):
+    pipeline.model.to("cpu")
+
+    del pipeline.model
+    del pipeline
+    torch.cuda.empty_cache()
+    garbage_collect()
+
+
 def run_text_generation_benchmark(
     model_name: str = "gpt2",
     n_repeat: int = 10,
     forward_only: bool = False,
     cpu_bench: bool = False,
+    batch_sizes: list[int] = BATCH_SIZES,
+    num_tokens_list: list[int] = NUM_TOKENS,
+    dtypes: list[torch.dtype] = DTYPES,
+    sdp_backends: list[SDPBackend] = SDP_BACKENDS,
 ) -> list[TextGenerationPipelineRecord]:
     records: list[TextGenerationPipelineRecord] = []
     try:
@@ -177,70 +193,79 @@ def run_text_generation_benchmark(
         )
         records.append(llm_record)
 
+    del generator.model
     del generator
 
     # EAGER mode
-    for params in tqdm(list(itertools.product(DTYPES, BATCH_SIZES, NUM_TOKENS))):
-        dtype, batch_size, num_tokens = params
-        if batch_size > len(get_questions()):
-            continue
+    with torch.inference_mode():
+        for params in tqdm(
+            list(itertools.product(dtypes, batch_sizes, num_tokens_list))
+        ):
+            dtype, batch_size, num_tokens = params
+            if batch_size > len(get_questions()):
+                continue
 
-        prompts = _get_prompts(batch_size, model_name)
-        generator = get_pipeline(model_name, batch_size, "cuda:0", dtype)
+            prompts = _get_prompts(batch_size, model_name)
+            generator = get_pipeline(model_name, batch_size, "cuda:0", dtype)
 
-        try:
-            with torch.inference_mode():
+            try:
                 run_warmup(generator)
                 time = run_generator(
                     generator, prompts, num_tokens, forward_only, batch_size, n_repeat
                 )
-        except RuntimeError as e:
-            time = -1.0
-            print(e)
-            continue
+            except RuntimeError as e:
+                time = -1.0
+                print(e)
+            finally:
+                cleanup(generator)
 
-        llm_record = TextGenerationPipelineRecord(
-            batch_size=batch_size,
-            num_tokens=num_tokens,
-            model=model_name,
-            sdp_backend="EAGER",
-            dtype=str(dtype),
-            bettertransformer=False,
-            time=time,
-            gpu=torch.cuda.get_device_name(),
-            prompts=prompts,
-            forward_only=forward_only,
-            compile=False,
-        )
-        del generator
-        torch.cuda.empty_cache()
-        records.append(llm_record)
+            llm_record = TextGenerationPipelineRecord(
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                model=model_name,
+                sdp_backend="EAGER",
+                dtype=str(dtype),
+                bettertransformer=False,
+                time=time,
+                gpu=torch.cuda.get_device_name(),
+                prompts=prompts,
+                forward_only=forward_only,
+                compile=False,
+            )
+            records.append(llm_record)
 
     # SDP mode
-    for params in tqdm(
-        list(
-            itertools.product(
-                SDP_BACKENDS,
-                DTYPES,
-                BETTERTRANSFORMER,
-                COMPILE,
-                BATCH_SIZES,
-                NUM_TOKENS,
+    with torch.inference_mode():
+        for params in tqdm(
+            list(
+                itertools.product(
+                    sdp_backends,
+                    dtypes,
+                    BETTERTRANSFORMER,
+                    COMPILE,
+                    batch_sizes,
+                    num_tokens_list,
+                )
             )
-        )
-    ):
-        sdp_backend, dtype, bettertransformer, compile, batch_size, num_tokens = params
-        if batch_size > len(get_questions()):
-            continue
+        ):
+            (
+                sdp_backend,
+                dtype,
+                bettertransformer,
+                compile,
+                batch_size,
+                num_tokens,
+            ) = params
+            if batch_size > len(get_questions()):
+                continue
 
-        prompts = _get_prompts(batch_size, model_name)
-        generator = get_pipeline(model_name, batch_size, "cuda:0", dtype)
+            prompts = _get_prompts(batch_size, model_name)
+            generator = get_pipeline(model_name, batch_size, "cuda:0", dtype)
 
-        with Optimizer(sdp_backend, dtype, bettertransformer, compile) as opt:
-            generator.model = opt(generator.model)
+            with Optimizer(sdp_backend, dtype, bettertransformer, compile) as opt:
+                generator.model = opt(generator.model)
 
-            try:
-                with torch.inference_mode():
+                try:
                     run_warmup(generator)
                     time = run_generator(
                         generator,
@@ -250,29 +275,29 @@ def run_text_generation_benchmark(
                         batch_size,
                         n_repeat,
                     )
-                del generator
-                torch.cuda.empty_cache()
-            except RuntimeError as e:
-                print(e)
-                time = -1.0
+                except RuntimeError as e:
+                    print(e)
+                    time = -1.0
+                finally:
+                    cleanup(generator)
 
-        llm_record = TextGenerationPipelineRecord(
-            batch_size=batch_size,
-            num_tokens=num_tokens,
-            model=model_name,
-            sdp_backend=opt.sdp_backend.name
-            if sdp_backend != SDPBackend.ERROR
-            else "NATIVE",
-            dtype=str(opt.dtype),
-            bettertransformer=opt.bettertransformer,
-            time=time,
-            gpu=torch.cuda.get_device_name(),
-            prompts=prompts,
-            forward_only=forward_only,
-            compile=opt.compile,
-            compile_mode=opt.compile_mode if opt.compile else None,
-        )
-        records.append(llm_record)
+            llm_record = TextGenerationPipelineRecord(
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                model=model_name,
+                sdp_backend=opt.sdp_backend.name
+                if sdp_backend != SDPBackend.ERROR
+                else "NATIVE",
+                dtype=str(opt.dtype),
+                bettertransformer=opt.bettertransformer,
+                time=time,
+                gpu=torch.cuda.get_device_name(),
+                prompts=prompts,
+                forward_only=forward_only,
+                compile=opt.compile,
+                compile_mode=opt.compile_mode if opt.compile else None,
+            )
+            records.append(llm_record)
 
     return records
 
@@ -282,12 +307,20 @@ def get_text_generation_benchmark_df(
     n_repeat: int = 8,
     forward_only: bool = False,
     cpu_bench: bool = False,
+    batch_sizes: list[int] = BATCH_SIZES,
+    num_tokens_list: list[int] = NUM_TOKENS,
+    dtypes: list[torch.dtype] = DTYPES,
+    sdp_backends: list[SDPBackend] = SDP_BACKENDS,
 ) -> pd.DataFrame:
     records = run_text_generation_benchmark(
         model_name=model_name,
         n_repeat=n_repeat,
         forward_only=forward_only,
         cpu_bench=cpu_bench,
+        batch_sizes=batch_sizes,
+        num_tokens_list=num_tokens_list,
+        dtypes=dtypes,
+        sdp_backends=sdp_backends,
     )
     return pd.DataFrame([r.__dict__ for r in records])
 

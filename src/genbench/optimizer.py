@@ -49,7 +49,7 @@ class Optimizer:
             self.bettertransformer = False
             print("Model does not support BetterTransformer")
 
-        model = model.to(dtype=self.dtype)
+        model.to(dtype=self.dtype)
 
         if self.compile:
             try:
